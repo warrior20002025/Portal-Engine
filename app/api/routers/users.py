@@ -415,7 +415,11 @@ async def generate_recommendations_endpoint(
         logger.info(f"Generating recommendations for user {user_id}")
         
         prompt = request.prompt
-        if prompt is None:
+        builder = PromptBuilder()
+        if prompt is not None:
+            # Wrap custom prompt to maintain strict JSON structure
+            prompt = builder.build_custom_prompt(prompt, current_city="Barcelona", max_results=5)
+        else:
             # Build the original prompt using live data; if any data missing, create minimal stand-ins
             user_service = get_optional_user_profile_service()
             lie_service = get_optional_lie_service()
@@ -452,16 +456,24 @@ async def generate_recommendations_endpoint(
                     preferences={},
                     engagement_score=0.5
                 )
-            builder = PromptBuilder()
             from app.core.constants import RecommendationType
-            prompt = builder.build_recommendation_prompt(
-                user_profile=user_profile,
-                location_data=location_data,
-                interaction_data=interaction_data,
-                recommendation_type=RecommendationType.PLACE,
-                max_results=5,
-            )
-            logger.info("Generated prompt for user", user_id=user_id, prompt_length=len(prompt) if prompt else 0)
+            if not any([user_profile, location_data, interaction_data]):
+                prompt = builder.build_fallback_prompt(
+                    user_profile=user_profile,
+                    location_data=location_data,
+                    interaction_data=interaction_data,
+                    recommendation_type=RecommendationType.PLACE,
+                    max_results=5,
+                )
+            else:
+                prompt = builder.build_recommendation_prompt(
+                    user_profile=user_profile,
+                    location_data=location_data,
+                    interaction_data=interaction_data,
+                    recommendation_type=RecommendationType.PLACE,
+                    max_results=5,
+                )
+        logger.info("Generated prompt for user", user_id=user_id, prompt_length=len(prompt) if prompt else 0)
         response = await llm_service.generate_recommendations(prompt, user_id)
         
         if response.get("success", False):
@@ -520,7 +532,10 @@ async def generate_recommendations_direct(
         logger.info("Generating recommendations without storing")
         
         prompt = request.prompt
-        if prompt is None:
+        builder = PromptBuilder()
+        if prompt is not None:
+            prompt = builder.build_custom_prompt(prompt, current_city="Barcelona", max_results=5)
+        else:
             # Build the original prompt with minimal anonymous context
             from app.models.schemas import UserProfile, LocationData, InteractionData
             anon_profile = UserProfile(
@@ -547,15 +562,24 @@ async def generate_recommendations_direct(
                 preferences={},
                 engagement_score=0.5
             )
-            builder = PromptBuilder()
+                
             from app.core.constants import RecommendationType
-            prompt = builder.build_recommendation_prompt(
-                user_profile=anon_profile,
-                location_data=anon_location,
-                interaction_data=anon_interactions,
-                recommendation_type=RecommendationType.PLACE,
-                max_results=5,
-            )
+            if not any([anon_profile, anon_location, anon_interactions]):
+                prompt = builder.build_fallback_prompt(
+                    user_profile=anon_profile,
+                    location_data=anon_location,
+                    interaction_data=anon_interactions,
+                    recommendation_type=RecommendationType.PLACE,
+                    max_results=5,
+                )
+            else:
+                prompt = builder.build_recommendation_prompt(
+                    user_profile=anon_profile,
+                    location_data=anon_location,
+                    interaction_data=anon_interactions,
+                    recommendation_type=RecommendationType.PLACE,
+                    max_results=5,
+                )
         response = await llm_service.generate_recommendations(prompt)
         
         if response.get("success", False):

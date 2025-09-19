@@ -559,3 +559,35 @@ Respond ONLY with the JSON object in this exact format."""
 
     def _get_json_structure_requirements(self) -> str:
         return "The JSON structure must match exactly the provided template, with all fields populated appropriately."
+
+    def build_custom_prompt(self, base_prompt: str, current_city: str = "Barcelona", max_results: int = 10) -> str:
+        """Wrap a provided base prompt with the same JSON template and strict rules.
+        Ensures the LLM returns the exact JSON object shape like build_fallback_prompt.
+        """
+        if not isinstance(base_prompt, str) or not base_prompt.strip():
+            # Fallback to a minimal directive if the custom prompt is invalid
+            base_prompt = "Provide personalized recommendations based on the following request."
+        timestamp = time.strftime("%Y-%m-%d %H:%M:%S UTC", time.gmtime())
+        guidance = f"""You are an expert recommendation system generating personalized suggestions as of {timestamp}.
+
+USER REQUEST:
+{base_prompt.strip()}
+
+RECOMMENDATION STRATEGY:
+- Generate {max_results} diverse, high-quality recommendations per category
+- Ensure variety in genres, styles, price points, and types
+- Use local {current_city} context where applicable
+
+{self._get_complete_json_structure(current_city)}
+
+CONTENT CREATION RULES:
+- Create REAL content: actual titles, names, and venues
+- Avoid placeholders; use realistic data and proper coordinates for {current_city} when relevant
+- For all URLs: Use accurate, real URLs based on your knowledge. If unknown, set to null
+- For social_media: Only include known full URLs. If unknown, set to {{}}
+
+PERSONALIZATION GUIDELINES:
+- Be specific in "why_would_you_like_this" fields and tie to the request when possible
+
+Respond ONLY with the JSON object in this exact format."""
+        return guidance

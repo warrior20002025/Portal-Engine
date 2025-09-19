@@ -1,6 +1,3 @@
-"""
-LLM Service for generating recommendations
-"""
 import json
 import time
 import random
@@ -9,6 +6,8 @@ from typing import Dict, Any, List, Optional
 from app.core.logging import get_logger, log_api_call, log_api_response, log_exception
 from app.core.config import settings
 import redis
+from datetime import datetime, timezone
+import math
 
 logger = get_logger("llm_service")
 
@@ -54,6 +53,7 @@ class LLMService:
         }
         self.BASE_SCORE = 0.5
         self.SCALE = 0.2  # scale for converting weighted sum into [0,1] range
+        self.HALF_LIFE_DAYS = 30  # recency half-life for interactions
     
     def _normalize_key(self, value: str) -> str:
         """Normalize string keys for comparison"""
@@ -61,9 +61,60 @@ class LLMService:
             return ""
         return ''.join(ch.lower() for ch in value if ch.isalnum() or ch.isspace()).strip()
 
+    def _tokenize(self, value: str) -> List[str]:
+        """Tokenize normalized value into words for partial matching."""
+        norm = self._normalize_key(value)
+        return [t for t in norm.split() if t]
+
+    def _recency_weight(self, iso_timestamp: str) -> float:
+        """Compute exponential recency weight in (0,1], newer -> closer to 1."""
+        try:
+            if iso_timestamp and isinstance(iso_timestamp, str):
+                ts = iso_timestamp.replace("Z", "+00:00")
+                dt = datetime.fromisoformat(ts)
+                if dt.tzinfo is None:
+                    dt = dt.replace(tzinfo=timezone.utc)
+                now = datetime.now(timezone.utc)
+                age_days = max(0.0, (now - dt).total_seconds() / 86400.0)
+                lam = math.log(2) / max(1.0, float(self.HALF_LIFE_DAYS))
+                weight = math.exp(-lam * age_days)
+                return max(0.1, min(1.0, weight))
+        except Exception:
+            pass
+        return 0.5
+
+    def _category_prior(self, item: Dict[str, Any], category: str) -> float:
+        """Small prior boost based on intrinsic item quality/popularity."""
+        try:
+            if category in ["movies", "music"]:
+                # rating often string; monthly_listeners may exist for music
+                rating_raw = item.get("rating")
+                rating = float(rating_raw) if isinstance(rating_raw, (int, float, str)) and str(rating_raw).replace('.', '', 1).isdigit() else None
+                listeners_raw = item.get("monthly_listeners")
+                listeners = float(str(listeners_raw).replace('M', '').replace(',', '')) if listeners_raw and isinstance(listeners_raw, (int, float, str)) and str(listeners_raw) else None
+                prior = 0.0
+                if rating is not None:
+                    prior += (max(0.0, min(10.0, rating)) - 5.0) / 50.0  # up to ±0.1
+                if listeners is not None:
+                    prior += min(0.1, listeners / 1e7)  # cap at 0.1
+                return prior
+            if category in ["places", "events"]:
+                rating_raw = item.get("rating")
+                rating = float(rating_raw) if isinstance(rating_raw, (int, float, str)) and str(rating_raw).replace('.', '', 1).isdigit() else None
+                total_raw = item.get("user_ratings_total")
+                total = float(total_raw) if isinstance(total_raw, (int, float)) else None
+                prior = 0.0
+                if rating is not None:
+                    prior += (max(0.0, min(5.0, rating)) - 3.0) / 20.0  # up to ±0.1
+                if total is not None:
+                    prior += min(0.1, total / 5000.0)
+                return prior
+        except Exception:
+            return 0.0
+        return 0.0
+
     def _setup_demo_data(self) -> None:
         """Setup demo data (placeholder for test compatibility)"""
-        # This method is expected by tests but not used in the main logic
         logger.info("Setting up demo data")
         return None
 
@@ -101,33 +152,40 @@ class LLMService:
         
         history = {
             "movies": [
-                {"title": "Inception", "action": "liked", "timestamp": "2024-08-15T10:30:00Z"},
-                {"title": "The Dark Knight", "action": "view", "timestamp": "2024-08-14T15:20:00Z"},
-                {"title": "Vicky Cristina Barcelona", "action": "ignored", "timestamp": "2024-08-13T09:45:00Z"},
-                {"title": "The Shawshank Redemption", "action": rnd.choice(["liked", "view", "saved"]), "timestamp": "2024-08-12T20:10:00Z"},
-                {"title": "All About My Mother", "action": rnd.choice(["view", "ignored"]), "timestamp": "2024-08-11T14:30:00Z"},
+                {"title": "Inception", "genre": "Science Fiction/Action", "action": "liked", "timestamp": "2024-08-15T10:30:00Z"},
+                {"title": "The Dark Knight", "genre": "Action/Crime", "action": "view", "timestamp": "2024-08-14T15:20:00Z"},
+                {"title": "Vicky Cristina Barcelona", "genre": "Drama/Romance", "action": "ignored", "timestamp": "2024-08-13T09:45:00Z"},
+                {"title": "The Shawshank Redemption", "genre": "Drama", "action": rnd.choice(["liked", "view", "saved"]), "timestamp": "2024-08-12T20:10:00Z"},
+                {"title": "All About My Mother", "genre": "Drama", "action": rnd.choice(["view", "ignored"]), "timestamp": "2024-08-11T14:30:00Z"},
             ],
             "music": [
-                {"title": "Blinding Lights", "action": "liked", "timestamp": "2024-08-16T12:00:00Z"},
-                {"title": "Barcelona", "action": "saved", "timestamp": "2024-08-15T18:45:00Z"},
-                {"title": "Shape of You", "action": rnd.choice(["view", "liked", "shared"]), "timestamp": "2024-08-14T11:20:00Z"},
-                {"title": "Mediterráneo", "action": rnd.choice(["ignored", "view"]), "timestamp": "2024-08-13T16:30:00Z"},
-                {"title": "Dance Monkey", "action": rnd.choice(["view", "disliked"]), "timestamp": "2024-08-12T13:15:00Z"},
+                {"title": "Blinding Lights", "genre": "Pop/Electronic", "action": "liked", "timestamp": "2024-08-16T12:00:00Z"},
+                {"title": "Barcelona", "genre": "Pop", "action": "saved", "timestamp": "2024-08-15T18:45:00Z"},
+                {"title": "Shape of You", "genre": "Pop", "action": rnd.choice(["view", "liked", "shared"]), "timestamp": "2024-08-14T11:20:00Z"},
+                {"title": "Mediterráneo", "genre": "Folk", "action": rnd.choice(["ignored", "view"]), "timestamp": "2024-08-13T16:30:00Z"},
+                {"title": "Dance Monkey", "genre": "Pop", "action": rnd.choice(["view", "disliked"]), "timestamp": "2024-08-12T13:15:00Z"},
             ],
             "places": [
-                {"name": "Sagrada Família", "action": "liked", "timestamp": "2024-08-17T09:00:00Z"},
-                {"name": "Eiffel Tower", "action": "view", "timestamp": "2024-08-16T14:30:00Z"},
-                {"name": "Park Güell", "action": rnd.choice(["liked", "saved"]), "timestamp": "2024-08-15T11:45:00Z"},
-                {"name": "Big Ben", "action": rnd.choice(["view", "ignored"]), "timestamp": "2024-08-14T17:20:00Z"},
-                {"name": "Colosseum", "action": rnd.choice(["view", "clicked"]), "timestamp": "2024-08-13T10:10:00Z"},
+                {"name": "Sagrada Família", "type": "attraction", "action": "liked", "timestamp": "2024-08-17T09:00:00Z"},
+                {"name": "Eiffel Tower", "type": "attraction", "action": "view", "timestamp": "2024-08-16T14:30:00Z"},
+                {"name": "Park Güell", "type": "park", "action": rnd.choice(["liked", "saved"]), "timestamp": "2024-08-15T11:45:00Z"},
+                {"name": "Big Ben", "type": "attraction", "action": rnd.choice(["view", "ignored"]), "timestamp": "2024-08-14T17:20:00Z"},
+                {"name": "Colosseum", "type": "attraction", "action": rnd.choice(["view", "clicked"]), "timestamp": "2024-08-13T10:10:00Z"},
             ],
             "events": [
-                {"name": "Primavera Sound", "action": "liked", "timestamp": "2024-08-18T08:30:00Z"},
-                {"name": "Coachella Valley Music and Arts Festival", "action": "ignored", "timestamp": "2024-08-17T19:15:00Z"},
-                {"name": "La Mercè Festival", "action": rnd.choice(["liked", "saved"]), "timestamp": "2024-08-16T15:45:00Z"},
-                {"name": "Oktoberfest", "action": rnd.choice(["view", "clicked"]), "timestamp": "2024-08-15T12:30:00Z"},
-                {"name": "Mardi Gras", "action": rnd.choice(["view", "ignored"]), "timestamp": "2024-08-14T16:00:00Z"},
+                {"name": "Primavera Sound", "category": "music", "action": "liked", "timestamp": "2024-08-18T08:30:00Z"},
+                {"name": "Coachella Valley Music and Arts Festival", "category": "music", "action": "ignored", "timestamp": "2024-08-17T19:15:00Z"},
+                {"name": "La Mercè Festival", "category": "festival", "action": rnd.choice(["liked", "saved"]), "timestamp": "2024-08-16T15:45:00Z"},
+                {"name": "Oktoberfest", "category": "festival", "action": rnd.choice(["view", "clicked"]), "timestamp": "2024-08-15T12:30:00Z"},
+                {"name": "Mardi Gras", "category": "festival", "action": rnd.choice(["view", "ignored"]), "timestamp": "2024-08-14T16:00:00Z"},
             ],
+        }
+        
+        genres_list = {
+            "movies": ["Action", "Drama", "Comedy", "Science Fiction", "Adventure"],
+            "music": ["Pop", "Electronic", "R&B", "Singer-Songwriter", "Folk"],
+            "places": ["attraction", "restaurant", "park", "museum", "trail"],
+            "events": ["music", "sports", "art", "festival"]
         }
         
         for category in history:
@@ -136,54 +194,290 @@ class LLMService:
                 for _ in range(extra_interactions):
                     action = rnd.choice(interaction_types)
                     timestamp = f"2024-08-{rnd.randint(10, 18):02d}T{rnd.randint(8, 20):02d}:{rnd.randint(0, 59):02d}:00Z"
-                    
-                    if category == "movies":
-                        title = f"Random Movie {rnd.randint(1, 100)}"
-                        history[category].append({"title": title, "action": action, "timestamp": timestamp})
-                    elif category == "music":
-                        title = f"Random Song {rnd.randint(1, 100)}"
-                        history[category].append({"title": title, "action": action, "timestamp": timestamp})
-                    elif category == "places":
-                        name = f"Random Place {rnd.randint(1, 100)}"
-                        history[category].append({"name": name, "action": action, "timestamp": timestamp})
-                    elif category == "events":
-                        name = f"Random Event {rnd.randint(1, 100)}"
-                        history[category].append({"name": name, "action": action, "timestamp": timestamp})
+                    genre_field = "genre" if category in ["movies", "music"] else "type" if category == "places" else "category"
+                    item_name = "title" if category in ["movies", "music"] else "name"
+                    item_value = f"Random {category.capitalize()} {rnd.randint(1, 100)}"
+                    genre_value = rnd.choice(genres_list[category])
+                    history[category].append({item_name: item_value, genre_field: genre_value, "action": action, "timestamp": timestamp})
         
         return history
 
-    def _compute_ranking_score(self, item: Dict[str, Any], category: str, history: Dict[str, List[Dict[str, str]]]) -> float:
+    def _compute_ranking_score(self, item: Dict[str, Any], category: str, history: Dict[str, List[Dict[str, str]]], 
+                               user_profile: Dict[str, Any] = None, location_data: Dict[str, Any] = None, 
+                               interaction_data: Dict[str, Any] = None) -> float:
         """
-        Compute ranking score in [0,1] using exact field matching for each category.
+        Compute raw ranking score using multiple factors with expanded ranges for more variation:
+        - Base: 0.2
+        - Quality: 0.0-0.3 (ratings, popularity, box office/chart/capacity)
+        - Profile: 0.0-0.25 (age, interest/keyword matches)
+        - Location: 0.0-0.2 (overlap, distance)
+        - Interaction: -0.2-0.3 (actions with recency and amplification)
+        - Recency: -0.2-0.2 (item age/date, penalty for past events)
         """
-        field_mapping = {
-            "movies": "title",
-            "music": "title", 
-            "places": "name",
-            "events": "name"
-        }
+        base_score = 0.2
+
+        # Quality boost with more factors
+        quality_boost = 0.0
+        rating = item.get('rating')
+        if rating:
+            try:
+                rating_val = float(str(rating).replace('/10', '').replace('/5', ''))
+                if category in ["places", "events"]:
+                    if rating_val >= 4.5:
+                        quality_boost += 0.25
+                    elif rating_val >= 4.0:
+                        quality_boost += 0.18
+                    elif rating_val >= 3.5:
+                        quality_boost += 0.12
+                    elif rating_val >= 3.0:
+                        quality_boost += 0.06
+                else:
+                    if rating_val >= 8.5:
+                        quality_boost += 0.25
+                    elif rating_val >= 7.5:
+                        quality_boost += 0.18
+                    elif rating_val >= 6.5:
+                        quality_boost += 0.12
+                    elif rating_val >= 5.0:
+                        quality_boost += 0.06
+            except:
+                pass
         
-        field_name = field_mapping.get(category, "title")
+        if category == "movies":
+            box = item.get('box_office', '')
+            if box:
+                try:
+                    num = float(box.strip('$').rstrip('M').strip())
+                    if num > 300:
+                        quality_boost += 0.15
+                    elif num > 200:
+                        quality_boost += 0.1
+                    elif num > 100:
+                        quality_boost += 0.05
+                except:
+                    pass
+        elif category == "music":
+            listeners = item.get('monthly_listeners', '')
+            try:
+                num_listeners = float(str(listeners).rstrip('M').strip()) if 'M' in str(listeners) else 0
+                quality_boost += min(0.15, num_listeners / 500)
+            except:
+                pass
+            chart = item.get('chart_position', '')
+            if chart:
+                if '#1' in chart:
+                    quality_boost += 0.2
+                else:
+                    try:
+                        pos = int(chart.strip('#').split()[0])
+                        if pos <= 5:
+                            quality_boost += 0.15
+                        elif pos <= 10:
+                            quality_boost += 0.1
+                        elif pos <= 20:
+                            quality_boost += 0.05
+                    except:
+                        pass
+        elif category in ["places", "events"]:
+            total_ratings = item.get('user_ratings_total', 0)
+            if total_ratings > 5000:
+                quality_boost += 0.15
+            elif total_ratings > 1000:
+                quality_boost += 0.1
+            elif total_ratings > 100:
+                quality_boost += 0.05
+            if category == "events":
+                cap = item.get('capacity', 0)
+                if cap > 20000:
+                    quality_boost += 0.15
+                elif cap > 5000:
+                    quality_boost += 0.1
+                elif cap > 1000:
+                    quality_boost += 0.05
+                price_min = item.get('price_min', float('inf'))
+                if price_min == 0:
+                    quality_boost += 0.1
+                elif price_min < 20:
+                    quality_boost += 0.07
+                elif price_min < 50:
+                    quality_boost += 0.03
+        quality_boost = min(0.3, quality_boost)
+
+        # Profile boost with keyword matching
+        profile_boost = 0.0
+        if user_profile:
+            user_age = user_profile.get('age')
+            if user_age and category in ["movies", "events"]:
+                if category == "movies":
+                    age_rating = item.get('age_rating', '')
+                    if ('R' in age_rating and user_age >= 17) or ('PG-13' in age_rating and user_age >= 13) or 'PG' in age_rating:
+                        profile_boost += 0.08
+                elif category == "events":
+                    age_restriction = item.get('age_restriction', '')
+                    if 'All ages' in age_restriction or ('18+' in age_restriction and user_age >= 18):
+                        profile_boost += 0.08
+            interests = user_profile.get('interests', [])
+            if interests:
+                item_text = f"{item.get('title', '')} {item.get('name', '')} {item.get('genre', '')} {item.get('description', '')} { ' '.join(item.get('keywords', [])) }".lower()
+                match_count = sum(1 for interest in interests if interest.lower() in item_text)
+                keyword_match = sum(1 for kw in item.get('keywords', []) if any(i.lower() in kw.lower() for i in interests))
+                profile_boost += min(0.15, (match_count + keyword_match) * 0.05)
+            interests_lower = [i.lower() for i in interests]
+            if 'sociable' in interests_lower:
+                if category == "music":
+                    mood_lower = item.get('mood', '').lower()
+                    if 'upbeat' in mood_lower:
+                        profile_boost += 0.1
+                    elif 'melancholic' in mood_lower:
+                        profile_boost -= 0.1
+                if category == "movies":
+                    genre_lower = item.get('genre', '').lower()
+                    if 'comedy' in genre_lower or 'adventure' in genre_lower:
+                        profile_boost += 0.05
+                if category == "places":
+                    if item.get('outdoor_seating', False) or item.get('wifi_available', False):
+                        profile_boost += 0.05
+                if category == "events":
+                    cat_lower = item.get('category', '').lower()
+                    if 'music' in cat_lower or 'festival' in cat_lower:
+                        profile_boost += 0.1
+                    elif 'art' in cat_lower:
+                        profile_boost += 0.08
+                    elif 'sports' in cat_lower:
+                        profile_boost += 0.05
+            if 'science-enthusiast' in interests_lower:
+                if category == "movies" or category == "music":
+                    genre_lower = item.get('genre', '').lower()
+                    if 'science fiction' in genre_lower or 'electronic' in genre_lower:
+                        profile_boost += 0.1
+        profile_boost = max(-0.2, min(0.25, profile_boost))
+
+        # Location boost with overlap score and distance
+        location_boost = 0.0
+        if location_data and category in ["places", "events"]:
+            current_location = location_data.get('current_location', '').lower()
+            if current_location:
+                item_location = ""
+                if category == "places":
+                    item_location = f"{item.get('vicinity', '')} {item.get('query', '')}".lower()
+                elif category == "events":
+                    item_location = f"{item.get('address', '')} {item.get('venue', '')}".lower()
+                if current_location in item_location:
+                    location_boost = 0.2
+                else:
+                    current_words = set(current_location.split())
+                    item_words = set(item_location.split())
+                    overlap = len(current_words & item_words) / len(current_words) if current_words else 0
+                    location_boost = overlap * 0.15
+                distance = item.get('distance_from_user', float('inf'))
+                if distance < 10:
+                    location_boost += 0.1
+                elif distance < 20:
+                    location_boost += 0.05
+                elif distance < 50:
+                    location_boost += 0.02
+            location_boost = min(0.2, location_boost)
+
+        # Interaction boost with recency and amplification
+        interaction_boost = 0.0
+        similarity_boost = 0.0
+        field_mapping = {"movies": "title", "music": "title", "places": "name", "events": "name"}
+        genre_field = {"movies": "genre", "music": "genre", "places": "type", "events": "category"}[category]
+        field_name = field_mapping[category]
         item_identifier = self._normalize_key(item.get(field_name, ""))
-        
-        total_weight = 0.0
-        interaction_count = 0
-        
-        for interaction in history.get(category, []):
-            hist_identifier = self._normalize_key(interaction.get(field_name, ""))
-            if hist_identifier and hist_identifier == item_identifier:
-                action = interaction.get("action", "view").lower()
-                weight = self.ACTION_WEIGHTS.get(action, 0.0)
-                total_weight += weight
-                interaction_count += 1
-        
-        if interaction_count == 0:
-            return self.BASE_SCORE
-        
-        score = self.BASE_SCORE + self.SCALE * total_weight
-        score = max(0.0, min(1.0, score))
-        return round(score, 3)
-    
+        item_genres = item.get(genre_field, '').lower().split('/')
+        if item_identifier:
+            total_weight = 0.0
+            count = 0
+            for inter in history.get(category, []):
+                hist_id = self._normalize_key(inter.get(field_name, ""))
+                if hist_id == item_identifier:
+                    action = inter.get("action", "view").lower()
+                    weight = {
+                        'liked': 0.2, 'saved': 0.15, 'shared': 0.12, 'clicked': 0.08,
+                        'view': 0.04, 'ignored': -0.1, 'disliked': -0.2
+                    }.get(action, 0.0)
+                    recency = self._recency_weight(inter.get('timestamp', ''))
+                    total_weight += weight * recency
+                    count += 1
+                # Similarity
+                hist_genres = inter.get(genre_field, '').lower().split('/')
+                overlap = len(set(item_genres) & set(hist_genres)) / max(1, len(item_genres)) if item_genres else 0
+                recency = self._recency_weight(inter.get('timestamp', ''))
+                if inter.get("action", "").lower() in ['liked', 'saved', 'shared', 'clicked']:
+                    similarity_boost += 0.1 * overlap * recency
+                elif inter.get("action", "").lower() in ['ignored', 'disliked']:
+                    similarity_boost -= 0.05 * overlap * recency
+            if count > 0:
+                interaction_boost = (total_weight / count) * (1 + 0.5 * (count - 1))
+            similarity_boost = max(-0.1, min(0.15, similarity_boost))
+            interaction_boost += similarity_boost
+        interaction_boost = max(-0.2, min(0.3, interaction_boost))
+
+        # Recency boost with penalty for old/past
+        recency_boost = 0.0
+        penalty = 0.0
+        now = datetime.now(timezone.utc)
+        if category == "movies":
+            year = item.get('year')
+            if year:
+                try:
+                    y = int(year)
+                    age = now.year - y
+                    if age <= 1:
+                        recency_boost = 0.2
+                    elif age <= 3:
+                        recency_boost = 0.15
+                    elif age <= 5:
+                        recency_boost = 0.1
+                    if age > 10:
+                        penalty = -0.05
+                    if age > 20:
+                        penalty = -0.1
+                except:
+                    pass
+        elif category == "music":
+            year = item.get('release_year')
+            if year:
+                try:
+                    y = int(year)
+                    age = now.year - y
+                    if age <= 1:
+                        recency_boost = 0.2
+                    elif age <= 2:
+                        recency_boost = 0.15
+                    elif age <= 4:
+                        recency_boost = 0.1
+                    if age > 6:
+                        penalty = -0.05
+                except:
+                    pass
+        elif category == "events":
+            date_str = item.get('date')
+            if date_str:
+                try:
+                    event_date = datetime.fromisoformat(date_str.replace('Z', '+00:00'))
+                    if event_date.tzinfo is None:
+                        event_date = event_date.replace(tzinfo=timezone.utc)
+                    days_diff = (event_date - now).days
+                    if days_diff > 90:
+                        recency_boost = 0.05
+                    elif days_diff > 30:
+                        recency_boost = 0.1
+                    elif days_diff > 7:
+                        recency_boost = 0.15
+                    elif days_diff >= 0:
+                        recency_boost = 0.2
+                    else:
+                        penalty = min(-0.2, -0.05 * abs(days_diff) / 30)
+                except:
+                    pass
+        recency_boost += penalty
+        recency_boost = max(-0.2, min(0.2, recency_boost))
+
+        raw_score = base_score + quality_boost + profile_boost + location_boost + interaction_boost + recency_boost
+        return max(0.0, min(1.5, raw_score))  # Allow up to 1.5 for normalization buffer
+
     async def generate_recommendations(self, prompt: str, user_id: str = None, current_city: str = "Barcelona") -> Dict[str, Any]:
         """
         Generate recommendations based on prompt and store in Redis
@@ -471,7 +765,7 @@ class LLMService:
     
     def _process_llm_recommendations(self, recommendations: Dict[str, Any], user_id: str = None, current_city: str = "Barcelona") -> Dict[str, List[Dict]]:
         """
-        Process and enhance recommendations from the LLM API
+        Process and enhance recommendations from the LLM API with normalized scores
         """
         try:
             processed = {
@@ -483,27 +777,87 @@ class LLMService:
             
             history = self._get_user_interaction_history(user_id) if user_id else {}
             
+            user_profile = None
+            location_data = None
+            interaction_data = None
+            
+            if user_id:
+                try:
+                    from app.services.user_profile import UserProfileService
+                    from app.services.lie_service import LIEService
+                    from app.services.cis_service import CISService
+                    import asyncio
+                    
+                    user_service = UserProfileService(timeout=10)
+                    lie_service = LIEService(timeout=10)
+                    cis_service = CISService(timeout=10)
+                    
+                    loop = asyncio.new_event_loop()
+                    asyncio.set_event_loop(loop)
+                    
+                    try:
+                        user_profile = loop.run_until_complete(user_service.get_user_profile(user_id))
+                        location_data = loop.run_until_complete(lie_service.get_location_data(user_id))
+                        interaction_data = loop.run_until_complete(cis_service.get_interaction_data(user_id))
+                        
+                        if user_profile:
+                            user_profile = user_profile.safe_dump() if hasattr(user_profile, 'safe_dump') else user_profile.model_dump()
+                        if location_data:
+                            location_data = location_data.safe_dump() if hasattr(location_data, 'safe_dump') else location_data.model_dump()
+                        if interaction_data:
+                            interaction_data = interaction_data.safe_dump() if hasattr(interaction_data, 'safe_dump') else interaction_data.model_dump()
+                            
+                    finally:
+                        loop.close()
+                        
+                except Exception as e:
+                    logger.warning(f"Could not fetch user data for enhanced scoring: {str(e)}")
+            
             for category, items in processed.items():
-                if not isinstance(items, list):
-                    processed[category] = []
+                if not isinstance(items, list) or not items:
                     continue
                     
+                # Compute raw scores
+                raw_scores = []
                 for item in items:
-                    if not isinstance(item, dict):
-                        continue
-                        
-                    item["ranking_score"] = self._compute_ranking_score(item, category, history) if user_id else self.BASE_SCORE
-                    
+                    if isinstance(item, dict):
+                        raw = self._compute_ranking_score(
+                            item, category, history, user_profile, location_data, interaction_data
+                        )
+                        item['_raw_score'] = raw
+                        raw_scores.append(raw)
+                
+                # Normalize to 0.1-1.0 range per category
+                if raw_scores:
+                    min_s = min(raw_scores)
+                    max_s = max(raw_scores)
+                    if max_s == min_s:
+                        norm_score = 0.5
+                        for item in items:
+                            item["ranking_score"] = round(norm_score, 2)
+                    else:
+                        for item in items:
+                            norm = 0.1 + 0.9 * (item['_raw_score'] - min_s) / (max_s - min_s)
+                            item["ranking_score"] = round(norm, 2)
+                    # Clean up
+                    for item in items:
+                        del item['_raw_score']
+                
+                # Generate reasons if missing
+                for item in items:
                     if not item.get("why_would_you_like_this"):
                         item["why_would_you_like_this"] = self._generate_personalized_reason(
                             item, category, "", user_id, current_city
                         )
+                
+                # Sort by ranking_score descending
+                items.sort(key=lambda x: x.get("ranking_score", 0), reverse=True)
             
             return processed
         except Exception as e:
             logger.error(f"Error processing LLM recommendations: {str(e)}")
             return self._get_fallback_recommendations()
-    
+
     def _get_fallback_recommendations(self) -> Dict[str, List[Dict]]:
         """
         Get fallback recommendations when LLM API fails
